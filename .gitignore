@@ -1,0 +1,14 @@
+# Build output
+Win10MenuBridge.exe
+Win10MenuBridge.pdb
+
+# Runtime log
+Win10MenuBridge.log
+
+# Windows 10 menu resources (Microsoft copyrighted; copy your own, see the README)
+res/
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
