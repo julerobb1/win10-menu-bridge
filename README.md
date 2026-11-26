@@ -25,7 +25,7 @@ Right-click one of these, and you get a native `TrackPopupMenu` popup with the W
 | Where you click | What you get |
 | --- | --- |
 | Network / Ethernet / Wi-Fi icon | Troubleshoot problems (classic Network Diagnostics), Open Network & Internet settings |
-| Volume / speaker icon | Open Sound settings, Open Volume mixer (classic `SndVol`), Sounds, Troubleshoot sound problems, and Spatial Audio when the Windows 10 resources are present |
+| Volume / speaker icon | Open Sound settings, Open Volume mixer (classic `SndVol`), Spatial sound (formats for the current playback device), Sounds, Troubleshoot sound problems |
 | Clock | The Windows 10 taskbar menu, including Adjust date/time and Customize notification icons |
 | Empty taskbar | Search, Show Task View button, Cascade / stacked / side by side, Show the desktop, Task Manager, Taskbar settings |
 
@@ -39,9 +39,10 @@ A separate user-mode process. Zero XAML. Nothing is loaded into `explorer.exe`.
 
 1. A background thread uses **UI Automation, read-only**, to cache the screen rectangles of the primary taskbar, the Network button, the Volume button, the Clock, and the other taskbar buttons.
 2. A **`WH_MOUSE_LL`** hook on its own thread checks each right-click against that cache (and a short-lived hover hit-test). Only a right-click on Network, Volume, Clock, or empty taskbar is swallowed. Anything else is passed through with `CallNextHookEx`.
-3. The helper builds the menu with **`TrackPopupMenuEx`**. If you have copied Windows 10 `.mui` files into `res\`, the menu text and order come from those files, loaded as data (`LOAD_LIBRARY_AS_DATAFILE`). If they are missing, built-in fallback strings are used. Commands launch the same Settings pages, classic applets, and Shell.Application calls those items have always used.
+3. The helper builds the menu with **`TrackPopupMenuEx`**, using built-in English strings. Commands launch the same Settings pages, classic applets, and Shell.Application calls those items have always used.
+4. The **Spatial sound** submenu is filled at click time for the current default playback device. Format names and Store links (Dolby Access, DTS Sound Unbound) come from the endpoint's advertised list. The active format, and switching it, go through the public WinRT class `Windows.Media.Audio.SpatialAudioDeviceConfiguration` — the same API the Settings app uses. If a format is not installed, the item is labeled "(get from Store)" and opens that Store link instead of switching. If the device does not support spatial audio, the format items are grayed and Off stays checked.
 
-There is no injection, no Explorer patching, no kernel component, and no network access. The compiler is the `csc.exe` that already ships with Windows. There is nothing to download.
+There is no injection, no Explorer patching, no kernel component, and no network access. The compiler is the `csc.exe` that already ships with Windows, plus the `Windows.Foundation.winmd` and `Windows.Media.winmd` metadata files already in `%WINDIR%\System32\WinMetadata`. There is nothing to download.
 
 ## Fail-safe
 
@@ -55,33 +56,39 @@ On a 64-bit Windows 11 machine, from the repo folder:
 build.cmd
 ```
 
-That runs the .NET Framework 4 compiler already at `%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe`. It produces `Win10MenuBridge.exe` next to the source. No Visual Studio, no NuGet, no SDK install, no downloads.
+That runs the .NET Framework 4 compiler already at `%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe`, and references `Windows.Foundation.winmd` and `Windows.Media.winmd` from `%WINDIR%\System32\WinMetadata` (they ship with Windows). It produces `Win10MenuBridge.exe` next to the source. No Visual Studio, no NuGet, no SDK install, no downloads.
 
 `app.manifest` marks the program Per-Monitor v2 DPI aware, so hit-testing stays in physical screen coordinates.
 
-## Optional: real Windows 10 menu resources
+## Optional: Windows 10 menu text
 
-This repository does **not** ship Microsoft's `.mui` or DLL files. Those are copyrighted. The helper reads them from a `res\` folder next to the exe if you put them there yourself, from **your own** Windows 10 install.
+You do not need any Windows 10 files. Built-in English strings are the default, including a Spatial sound submenu.
 
-From a Windows 10 machine, or from a mounted Windows 10 `Windows` directory, copy these three files into `res\`:
+If you want the original Windows 10 wording and item order, you can copy these three copyrighted `.mui` files from **your own** Windows 10 install into a `res\` folder next to the exe. This repository does not ship them. Load them as data only; do not register them or drop them into Windows 11's System32.
 
 ```text
 %SystemRoot%\System32\<locale>\pnidui.dll.mui
 %SystemRoot%\System32\<locale>\SndVolSSO.dll.mui
-%SystemRoot%\en-US\explorer.exe.mui      (use your locale folder; often en-US)
+%SystemRoot%\<locale>\explorer.exe.mui
 ```
 
-`<locale>` is usually `en-US`. Use `en-GB`, `de-DE`, and so on if that is your Windows 10 language.
-
-Load them as data only. Do not register them, do not drop them in System32 on Windows 11, and do not replace anything in the Windows 11 install.
-
-If `res\` is missing or incomplete, the helper still runs, using built-in English fallback strings for the same commands.
+`<locale>` is usually `en-US`.
 
 ## Run
 
 Start `Win10MenuBridge.exe`. A tray icon named "Win10 Menu Bridge" appears. It is a single-instance program; a second launch exits immediately.
 
 To have it start with Windows, put a shortcut to the exe in your Startup folder (`shell:startup`). This repo does not add a startup entry, a service, or a scheduled task for you.
+
+## `--dump-spatial`
+
+A read-only diagnostic. From the folder that contains the exe:
+
+```bat
+Win10MenuBridge.exe --dump-spatial
+```
+
+This does not start the hook or the tray icon. It writes `spatial-dump.txt` next to the exe (default playback endpoint, whether spatial audio is supported, the active format, and each advertised format's GUID, name, installed flag, and Store URI) and then exits. The dump file is not part of the repository.
 
 ## Uninstall
 
@@ -101,7 +108,7 @@ Other limits:
 
 - **Primary monitor only.** The helper hit-tests `Shell_TrayWnd`. Secondary taskbars are not covered.
 - **Mouse right-click only.** `Shift+F10` and the Menu key still open the stock Windows 11 menu.
-- **Spatial Audio.** Windows 10 filled that submenu with the formats the device actually supported. This helper cannot do that reconstruction; with the Windows 10 resources present, the leftover item opens the device's spatial sound settings instead of listing formats. The fallback menu leaves Spatial Audio out.
+- **Spatial sound** lists the formats advertised for the current default playback device and can only switch formats that device supports. If spatial audio is not supported on that endpoint, the format items are grayed. Dolby Atmos and DTS:X need their Store apps (Dolby Access, DTS Sound Unbound); if the app is missing, the item opens the Store link from the endpoint instead of switching. `--dump-spatial` is the way to see what the helper found for the current device.
 - Icon names are matched in English (Network, Ethernet, Wi-Fi, Volume, Speaker, Clock, and common variants). A different display language may need a small classification tweak.
 - Tested on **Windows 11 25H2, build 26200**. Other builds may change automation IDs or taskbar structure; if a click is missed, the stock menu still appears.
 

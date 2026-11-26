@@ -8,8 +8,8 @@
 //     Only right-clicks on Network / Volume / Clock / empty taskbar are swallowed; everything else
 //     passes through untouched. If the cache is stale or anything is uncertain, the click passes
 //     through and the stock Windows 11 menu appears.
-//   * Menus are loaded from the Windows 10 .mui files in .\res (copied as data from a Windows 10 install),
-//     with a built-in fallback if they are missing. Commands launch standard Windows panels.
+//   * Menus use built-in English strings by default. Optional Windows 10 .mui files in .\res
+//     (copied as data from a Windows 10 install) override the text and order if present.
 // Exit: tray icon -> Exit (or kill the process). Stock menus come back immediately.
 using System;
 using System.Collections.Generic;
@@ -48,6 +48,7 @@ static class NativeMethods
     [DllImport("user32")] public static extern bool DestroyMenu(IntPtr m);
     [DllImport("user32")] public static extern IntPtr CreatePopupMenu();
     [DllImport("user32", CharSet = CharSet.Unicode)] public static extern bool AppendMenu(IntPtr m, uint f, IntPtr id, string s);
+    [DllImport("user32", CharSet = CharSet.Unicode)] public static extern bool InsertMenu(IntPtr m, uint pos, uint f, IntPtr id, string s);
     [DllImport("user32")] public static extern uint TrackPopupMenuEx(IntPtr m, uint f, int x, int y, IntPtr hwnd, IntPtr p);
     [DllImport("user32")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32")] public static extern IntPtr GetForegroundWindow();
@@ -140,6 +141,21 @@ static class Program
     {
         try { NativeMethods.SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch { } // per-monitor v2: physical coords everywhere
         logPath = Path.Combine(baseDir, "Win10MenuBridge.log");
+        if (args.Length > 0 && args[0] == "--dump-spatial")
+        {
+            // Read-only diagnostic: writes the spatial formats found for the default render endpoint to spatial-dump.txt and exits.
+            var sb = new StringBuilder();
+            try
+            {
+                SpatialAudio.Refresh();
+                sb.AppendLine("endpoint: " + SpatialAudio.DeviceId);
+                sb.AppendLine("supported: " + SpatialAudio.Supported + "  active: " + SpatialAudio.Active);
+                foreach (var f in SpatialAudio.Formats) sb.AppendLine(f.Id + "  " + f.Name + "  installed=" + f.Installed + "  " + f.StoreUri);
+            }
+            catch (Exception e) { sb.AppendLine("error: " + e); }
+            File.WriteAllText(Path.Combine(baseDir, "spatial-dump.txt"), sb.ToString());
+            return;
+        }
         bool created;
         using (var mtx = new Mutex(true, "Local\\Win10MenuBridge_SingleInstance", out created))
         {
@@ -412,6 +428,98 @@ static class Program
     public static void SetMenuOpen(bool v) { menuOpen = v; }
 }
 
+
+// ---------- Spatial sound (Windows Sonic / Dolby Atmos / DTS:X) ----------
+// Same data Windows itself uses:
+//   * the list of formats for an endpoint is the endpoint property {a45429a4-aa63-4480-b7f8-3f2552daee93},2..N
+//     under HKLM\...\MMDevices\Audio\Render\{endpoint}\Properties (fixed record: name[256] wchar, store URI[128] wchar, format GUID)
+//   * the active format and switching it use the public WinRT class Windows.Media.Audio.SpatialAudioDeviceConfiguration
+//     (the same API the Settings app uses). Nothing is installed or written to the registry by us.
+class SpatialFormat
+{
+    public string Name, StoreUri; public Guid Id; public bool Installed;
+}
+
+static class SpatialAudio
+{
+    public static List<SpatialFormat> Formats = new List<SpatialFormat>();
+    public static string DeviceId;
+    public static Guid Active = Guid.Empty;
+    public static bool Supported;
+
+    const string KeyBase = @"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render\";
+    const string PropFmt = "{a45429a4-aa63-4480-b7f8-3f2552daee93},";
+
+    static string EndpointGuid(string deviceId)
+    {
+        // \\?\SWD#MMDEVAPI#{0.0.0.00000000}.{GUID}#{e6327cad-...}
+        int i = deviceId.IndexOf("}.{", StringComparison.Ordinal);
+        if (i < 0) return null;
+        int j = deviceId.IndexOf('}', i + 3);
+        return deviceId.Substring(i + 2, j - (i + 2) + 1);
+    }
+
+    static string ReadStr(byte[] b, int off, int maxChars)
+    {
+        int n = 0; while (n < maxChars && off + 2 * n + 1 < b.Length && (b[off + 2 * n] != 0 || b[off + 2 * n + 1] != 0)) n++;
+        return Encoding.Unicode.GetString(b, off, n * 2);
+    }
+
+    static bool PackageInstalled(string prefix)
+    {
+        try
+        {
+            using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages"))
+            {
+                if (k == null) return false;
+                foreach (var n in k.GetSubKeyNames()) if (n.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    // Loads formats for the current default render endpoint + the active format. Call on the UI thread when the menu opens.
+    public static void Refresh()
+    {
+        Formats = new List<SpatialFormat>(); Active = Guid.Empty; Supported = false; DeviceId = null;
+        DeviceId = Windows.Media.Devices.MediaDevice.GetDefaultAudioRenderId(Windows.Media.Devices.AudioDeviceRole.Default);
+        string eg = EndpointGuid(DeviceId);
+        var cfg = Windows.Media.Audio.SpatialAudioDeviceConfiguration.GetForDeviceId(DeviceId);
+        Supported = cfg.IsSpatialAudioSupported;
+        Guid act; if (Guid.TryParse(cfg.ActiveSpatialAudioFormat, out act)) Active = act;
+        bool dolby = PackageInstalled("DolbyLaboratories.DolbyAccess_");
+        bool dts = PackageInstalled("DTSInc.DTSSoundUnbound_") || PackageInstalled("DTSInc.DTSXUltra") || PackageInstalled("DTSInc.");
+        if (eg == null) return;
+        for (int i = 2; i < 24; i++)
+        {
+            byte[] b = Registry.GetValue(KeyBase + eg + "\\Properties", PropFmt + i, null) as byte[];
+            if (b == null) break;
+            if (b.Length < 8 + 512 + 256 + 16) continue;
+            var f = new SpatialFormat();
+            f.Name = ReadStr(b, 8, 256);
+            f.StoreUri = ReadStr(b, 8 + 512, 128);
+            var gb = new byte[16]; Array.Copy(b, 8 + 512 + 256, gb, 0, 16); f.Id = new Guid(gb);
+            bool needsStore = f.StoreUri.Length > 0;
+            f.Installed = !needsStore || (f.Name.StartsWith("Dolby", StringComparison.OrdinalIgnoreCase) ? dolby : dts);
+            if (f.Name.Length > 0) Formats.Add(f);
+        }
+    }
+
+    // Returns status text. Uses the same call Windows Settings makes.
+    public static string Set(Guid id)
+    {
+        var cfg = Windows.Media.Audio.SpatialAudioDeviceConfiguration.GetForDeviceId(DeviceId ?? Windows.Media.Devices.MediaDevice.GetDefaultAudioRenderId(Windows.Media.Devices.AudioDeviceRole.Default));
+        var op = cfg.SetDefaultSpatialAudioFormatAsync(id.ToString("B").ToUpperInvariant());
+        var info = (Windows.Foundation.IAsyncInfo)op;
+        int waited = 0;
+        while (info.Status == Windows.Foundation.AsyncStatus.Started && waited < 8000) { Thread.Sleep(25); waited += 25; }
+        if (info.Status == Windows.Foundation.AsyncStatus.Started) return "timeout";
+        if (info.Status != Windows.Foundation.AsyncStatus.Completed) return "async-" + info.Status;
+        return op.GetResults().Status.ToString();
+    }
+}
+
 class MenuHost : Form
 {
     NotifyIcon icon;
@@ -552,7 +660,8 @@ class MenuHost : Form
             }
             else if (t == Target.Volume)
             {
-                // Spatial Audio submenu: Windows 10 listed formats dynamically; here "Off" opens the device's spatial sound settings.
+                try { BuildSpatialMenu(menu); }
+                catch (Exception e) { Program.Log("spatial menu skipped: " + e.Message); }
             }
 
             ForceForeground();
@@ -563,6 +672,41 @@ class MenuHost : Form
         }
         catch (Exception e) { Program.Log("menu error: " + e); }
         finally { if (bar != IntPtr.Zero) NativeMethods.DestroyMenu(bar); Program.SetMenuOpen(false); }
+    }
+
+    const int SPATIAL_OFF = 40100, SPATIAL_BASE = 41000;
+
+    void BuildSpatialMenu(IntPtr menu)
+    {
+        SpatialAudio.Refresh();
+        IntPtr sub = IntPtr.Zero;
+        for (int i = 0; i < NativeMethods.GetMenuItemCount(menu); i++)
+        {
+            IntPtr s = NativeMethods.GetSubMenu(menu, i);
+            if (s == IntPtr.Zero) continue;
+            for (int j = 0; j < NativeMethods.GetMenuItemCount(s); j++) if (NativeMethods.GetMenuItemID(s, j) == SPATIAL_OFF) { sub = s; break; }
+            if (sub != IntPtr.Zero) break;
+        }
+        if (sub == IntPtr.Zero)
+        {
+            // Built-in volume menu has no Spatial sound popup (that item lives in the optional .mui).
+            // Create one so formats still appear with no Windows 10 files present.
+            sub = NativeMethods.CreatePopupMenu();
+            NativeMethods.AppendMenu(sub, NativeMethods.MF_STRING, new IntPtr(SPATIAL_OFF), "Off");
+            if (!NativeMethods.InsertMenu(menu, 2, NativeMethods.MF_BYPOSITION | NativeMethods.MF_POPUP, sub, "Spatial sound"))
+                NativeMethods.AppendMenu(menu, NativeMethods.MF_POPUP, sub, "Spatial sound");
+        }
+        Program.Log("spatial: endpoint " + SpatialAudio.DeviceId + " supported=" + SpatialAudio.Supported + " active=" + SpatialAudio.Active + " formats=" + SpatialAudio.Formats.Count);
+        uint grayed = SpatialAudio.Supported ? 0u : NativeMethods.MF_GRAYED;
+        for (int k = 0; k < SpatialAudio.Formats.Count; k++)
+        {
+            var f = SpatialAudio.Formats[k];
+            string label = f.Name.Replace("&", "&&") + (f.Installed ? "" : " (get from Store)");
+            NativeMethods.AppendMenu(sub, NativeMethods.MF_STRING | grayed, new IntPtr(SPATIAL_BASE + k), label);
+            if (f.Id == SpatialAudio.Active) NativeMethods.CheckMenuItem(sub, (uint)(SPATIAL_BASE + k), NativeMethods.MF_CHECKED);
+        }
+        if (SpatialAudio.Active == Guid.Empty) NativeMethods.CheckMenuItem(sub, SPATIAL_OFF, NativeMethods.MF_CHECKED);
+        if (!SpatialAudio.Supported) NativeMethods.CheckMenuItem(sub, SPATIAL_OFF, NativeMethods.MF_CHECKED);
     }
 
     // The swallowed click never reached any window, so Windows won't let us take the foreground by default.
@@ -614,7 +758,7 @@ class MenuHost : Form
             // sound (SndVolSSO)
             case 40012: Start("ms-settings:sound"); break;
             case 40001: Start(Path.Combine(sys, "SndVol.exe")); break;
-            case 40100: Start("ms-settings:sound"); break;
+            case 40100: SetSpatial(Guid.Empty, "Off", null); break;
             case 40007: Start(Path.Combine(sys, "rundll32.exe"), "shell32.dll,Control_RunDLL mmsys.cpl,,2"); break;
             case 40008: Start(Path.Combine(sys, "msdt.exe"), "-id AudioPlaybackDiagnostic"); break;
             // taskbar / clock (explorer)
@@ -632,6 +776,29 @@ class MenuHost : Form
             case 407: ShellCall("ToggleDesktop"); break;
             case 420: Start(Path.Combine(sys, "Taskmgr.exe")); break;
             case 413: Start("ms-settings:taskbar"); break;
+            default:
+                if (cmd >= SPATIAL_BASE && cmd < SPATIAL_BASE + 64)
+                {
+                    int k = cmd - SPATIAL_BASE;
+                    if (k < SpatialAudio.Formats.Count)
+                    {
+                        var f = SpatialAudio.Formats[k];
+                        if (!f.Installed && f.StoreUri.Length > 0) { Program.Log("spatial: " + f.Name + " not installed -> store " + f.StoreUri); Start(f.StoreUri); }
+                        else SetSpatial(f.Id, f.Name, f.StoreUri);
+                    }
+                }
+                break;
         }
+    }
+
+    static void SetSpatial(Guid id, string name, string storeUri)
+    {
+        try
+        {
+            string r = SpatialAudio.Set(id);
+            Program.Log("spatial set " + name + " " + id + " -> " + r);
+            if (r != "Succeeded" && !string.IsNullOrEmpty(storeUri)) Start(storeUri);
+        }
+        catch (Exception e) { Program.Log("spatial set failed: " + e.Message); }
     }
 }

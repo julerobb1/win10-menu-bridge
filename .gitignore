@@ -2,8 +2,9 @@
 Win10MenuBridge.exe
 Win10MenuBridge.pdb
 
-# Runtime log
+# Runtime log / diagnostics
 Win10MenuBridge.log
+spatial-dump.txt
 
 # Windows 10 menu resources (Microsoft copyrighted; copy your own, see the README)
 res/
